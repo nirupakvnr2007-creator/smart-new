@@ -808,6 +808,21 @@ app.get('/api/runtime', (_req, res) => {
 });
 
   // 11. MONGODB MANAGEMENT & COMPASS SYNC ENDPOINTS
+  app.get('/api/runtime', async (_req, res) => {
+  try {
+    const mongodb = await import('mongodb');
+    res.json({
+      nodeVersion: process.version,
+      mongodbDriverLoaded: !!mongodb.MongoClient
+    });
+  } catch (error) {
+    res.status(500).json({
+      nodeVersion: process.version,
+      mongodbDriverLoaded: false,
+      error: String(error)
+    });
+  }
+});
   app.get('/api/mongodb/status', async (_req, res) => {
     const isConnected = mongoManager.isConnected;
     const db = mongoManager.getDb();
