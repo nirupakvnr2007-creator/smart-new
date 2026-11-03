@@ -135,7 +135,7 @@ class MongoManager {
         }
 
         if (!silent) {
-          console.log(`Checking MongoDB connection at ${targetUri}...`);
+          console.log(`Checking MongoDB connection at ${this.getMaskedUri()}...`);
         }
         this.client = new MongoClient(targetUri, {
           serverSelectionTimeoutMS: 2000,
@@ -796,6 +796,16 @@ async function startServer() {
 
     res.json({ success: true, forumPosts: fileDb.forumPosts });
   });
+  // RUNTIME DIAGNOSTICS
+app.get('/api/runtime', (_req, res) => {
+  res.json({
+    nodeVersion: process.version,
+    platform: process.platform,
+    environment: process.env.NODE_ENV || 'not set',
+    mongodbDependency:
+      process.env.npm_package_dependencies_mongodb || 'not available'
+  });
+});
 
   // 11. MONGODB MANAGEMENT & COMPASS SYNC ENDPOINTS
   app.get('/api/mongodb/status', async (_req, res) => {
