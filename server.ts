@@ -19,6 +19,15 @@ const DB_DIR = path.resolve(process.cwd(), 'data');
 const DB_FILE = path.join(DB_DIR, 'smart_inventory_db.json');
 const MONGO_CONFIG_FILE = path.join(DB_DIR, 'mongo_config.json');
 
+// FIX 1: must match the database name shown in Atlas (smart_inventory_db).
+// Can be overridden with the MONGODB_DB environment variable on Render.
+const DB_NAME = process.env.MONGODB_DB || 'smart_inventory_db';
+
+// Escape user input before putting it into a RegExp (emails can contain + . etc.)
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 // --- Standalone Persistent Database Engine ---
 function ensureDbFile(): DbSchema {
   if (!fs.existsSync(DB_DIR)) {
@@ -75,6 +84,8 @@ class MongoManager {
   private client: MongoClient | null = null;
   private db: Db | null = null;
   private uri: string = '';
+  private connecting: boolean = false;
+  private lastLoggedError: string | null = null;
   public isConnected: boolean = false;
   public lastError: string | null = null;
 
@@ -99,7 +110,7 @@ class MongoManager {
       // ignore
     }
     // Offline default: connect directly to local MongoDB Compass on standard port 27017
-    this.uri = 'mongodb://127.0.0.1:27017/smart_inventory';
+    this.uri = `mongodb://127.0.0.1:27017/${DB_NAME}`;
   }
 
   public getUri(): string {
@@ -111,7 +122,20 @@ class MongoManager {
     return this.uri.replace(/:([^@]+)@/, ':****@');
   }
 
+  // FIX 2: guard so the 30s retry timer never starts a second attempt while one is running
   public async connect(customUri?: string, silent: boolean = false): Promise<{ success: boolean; message: string }> {
+    if (this.connecting) {
+      return { success: this.isConnected, message: 'A connection attempt is already in progress' };
+    }
+    this.connecting = true;
+    try {
+      return await this.doConnect(customUri, silent);
+    } finally {
+      this.connecting = false;
+    }
+  }
+
+  private async doConnect(customUri?: string, silent: boolean = false): Promise<{ success: boolean; message: string }> {
     const primaryUri = customUri || this.uri;
     if (!primaryUri) {
       this.isConnected = false;
@@ -137,25 +161,31 @@ class MongoManager {
         if (!silent) {
           console.log(`Checking MongoDB connection at ${this.getMaskedUri()}...`);
         }
+        // FIX 3: 2s was too short for Atlas from Render (DNS SRV + TLS handshake)
         this.client = new MongoClient(targetUri, {
-          serverSelectionTimeoutMS: 2000,
-          connectTimeoutMS: 2000
+          serverSelectionTimeoutMS: 15000,
+          connectTimeoutMS: 15000
         });
 
         await this.client.connect();
-        this.db = this.client.db('smart_inventory');
+        this.db = this.client.db(DB_NAME);
         this.isConnected = true;
         this.uri = targetUri;
         this.lastError = null;
+        this.lastLoggedError = null;
 
-        try {
-          if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
-          fs.writeFileSync(MONGO_CONFIG_FILE, JSON.stringify({ uri: targetUri }, null, 2));
-        } catch {}
+        // Only persist the URI to disk when it did not come from the environment,
+        // so the Atlas password is not written into data/mongo_config.json on Render.
+        if (!process.env.MONGODB_URI) {
+          try {
+            if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
+            fs.writeFileSync(MONGO_CONFIG_FILE, JSON.stringify({ uri: targetUri }, null, 2));
+          } catch {}
+        }
 
-        console.log(`[MongoDB] Connected successfully to database "smart_inventory" at ${targetUri}!`);
+        console.log(`[MongoDB] Connected successfully to database "${DB_NAME}"!`);
         await this.initializeTables();
-        return { success: true, message: `Connected to MongoDB database smart_inventory successfully at ${targetUri}` };
+        return { success: true, message: `Connected to MongoDB database ${DB_NAME} successfully` };
       } catch (err: any) {
         lastErr = err;
       }
@@ -163,8 +193,14 @@ class MongoManager {
 
     this.isConnected = false;
     this.lastError = lastErr?.message || 'MongoDB server not reachable';
+
+    // FIX 4: always log a *new* failure reason (even in silent mode) so it shows up in Render logs
+    if (this.lastError !== this.lastLoggedError) {
+      console.error(`[MongoDB] Connection failed: ${this.lastError}`);
+      this.lastLoggedError = this.lastError;
+    }
     if (!silent) {
-      console.log('[Database Engine] Local mirror active (smart_inventory_db.json). Ready for local MongoDB Compass on port 27017.');
+      console.log('[Database Engine] Local mirror active (smart_inventory_db.json) because MongoDB is not reachable.');
     }
     return { success: false, message: this.lastError || 'Failed to connect to MongoDB' };
   }
@@ -259,7 +295,7 @@ class MongoManager {
         success: true,
         collections: requiredCollections,
         counts,
-        message: 'All 7 tables (collections) created and synchronized with MongoDB Compass successfully!'
+        message: 'All 7 tables (collections) created and synchronized with MongoDB successfully!'
       };
     } catch (err: any) {
       return {
@@ -298,7 +334,7 @@ async function startServer() {
   // Initialize MongoDB connection check silently with local JSON storage as primary active engine
   mongoManager.connect(undefined, true).catch(() => {});
 
-  // Gentle background reconnect if user launches MongoDB locally or via start-offline.bat
+  // Gentle background reconnect if MongoDB becomes reachable later
   setInterval(() => {
     if (!mongoManager.isConnected) {
       mongoManager.connect(undefined, true).catch(() => {});
@@ -350,15 +386,16 @@ async function startServer() {
       return res.status(400).json({ success: false, message: 'Email and password required' });
     }
 
-    const trimmedEmail = email.trim().toLowerCase();
-    const cleanPassword = password.trim();
+    const trimmedEmail = String(email).trim().toLowerCase();
+    const cleanPassword = String(password).trim();
 
     // Check MongoDB if connected
     const db = mongoManager.getDb();
     if (db) {
       try {
         const user = await db.collection('users').findOne({
-          email: { $regex: new RegExp(`^${trimmedEmail}$`, 'i') },
+          // FIX 5: escape the email so characters like + or . cannot break the regex
+          email: { $regex: new RegExp(`^${escapeRegex(trimmedEmail)}$`, 'i') },
           password: cleanPassword
         });
         if (user) {
@@ -799,20 +836,21 @@ async function startServer() {
 
   // 11. MONGODB MANAGEMENT & COMPASS SYNC ENDPOINTS
   app.get('/api/runtime', async (_req, res) => {
-  try {
-    const mongodb = await import('mongodb');
-    res.json({
-      nodeVersion: process.version,
-      mongodbDriverLoaded: !!mongodb.MongoClient
-    });
-  } catch (error) {
-    res.status(500).json({
-      nodeVersion: process.version,
-      mongodbDriverLoaded: false,
-      error: String(error)
-    });
-  }
-});
+    try {
+      const mongodb = await import('mongodb');
+      res.json({
+        nodeVersion: process.version,
+        mongodbDriverLoaded: !!mongodb.MongoClient
+      });
+    } catch (error) {
+      res.status(500).json({
+        nodeVersion: process.version,
+        mongodbDriverLoaded: false,
+        error: String(error)
+      });
+    }
+  });
+
   app.get('/api/mongodb/status', async (_req, res) => {
     const isConnected = mongoManager.isConnected;
     const db = mongoManager.getDb();
@@ -832,7 +870,7 @@ async function startServer() {
     res.json({
       connected: isConnected,
       uriMasked: mongoManager.getMaskedUri(),
-      databaseName: 'smart_inventory',
+      databaseName: DB_NAME,
       counts,
       lastError: mongoManager.lastError
     });
@@ -869,6 +907,7 @@ async function startServer() {
     const result = await mongoManager.initializeTables();
     res.json(result);
   });
+
   app.post('/api/mongodb/import-compass', async (req, res) => {
     const { collection, documents } = req.body;
     if (!collection || !Array.isArray(documents)) {
@@ -936,15 +975,16 @@ async function startServer() {
     const url = `http://localhost:${PORT}`;
     console.log(`===================================================`);
     console.log(`  Mepco Retail Hub running on ${url}`);
-    console.log(`  Target Database: MongoDB smart_inventory`);
+    console.log(`  Target Database: MongoDB ${DB_NAME}`);
     console.log(`===================================================`);
 
     // Auto-open browser on local desktop environments
     if (
-        process.env.NODE_ENV !== 'production' &&
-        process.env.AUTO_OPEN !== 'false' &&
-        !process.env.K_SERVICE
-      ) {
+      process.env.NODE_ENV !== 'production' &&
+      process.env.AUTO_OPEN !== 'false' &&
+      !process.env.K_SERVICE &&
+      !process.env.RENDER
+    ) {
       setTimeout(() => {
         const openCmd =
           process.platform === 'win32'
