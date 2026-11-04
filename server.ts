@@ -796,16 +796,6 @@ async function startServer() {
 
     res.json({ success: true, forumPosts: fileDb.forumPosts });
   });
-  // RUNTIME DIAGNOSTICS
-app.get('/api/runtime', (_req, res) => {
-  res.json({
-    nodeVersion: process.version,
-    platform: process.platform,
-    environment: process.env.NODE_ENV || 'not set',
-    mongodbDependency:
-      process.env.npm_package_dependencies_mongodb || 'not available'
-  });
-});
 
   // 11. MONGODB MANAGEMENT & COMPASS SYNC ENDPOINTS
   app.get('/api/runtime', async (_req, res) => {
@@ -950,7 +940,11 @@ app.get('/api/runtime', (_req, res) => {
     console.log(`===================================================`);
 
     // Auto-open browser on local desktop environments
-    if (process.env.AUTO_OPEN !== 'false' && !process.env.K_SERVICE) {
+    if (
+        process.env.NODE_ENV !== 'production' &&
+        process.env.AUTO_OPEN !== 'false' &&
+        !process.env.K_SERVICE
+      ) {
       setTimeout(() => {
         const openCmd =
           process.platform === 'win32'
